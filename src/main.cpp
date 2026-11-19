@@ -105,9 +105,8 @@ bool compActiva = false;              // 'F' la prende/apaga, 'R' borra lo apren
 const uint32_t T_PANTALLA = 500000; // cada cuánto se muestra una línea en la vista legible (us) = 0,5 s
 const uint8_t  N_MEDIA    = 200;    // media móvil simple de VM: 200 muestras x 10 ms = 2 s
 #define SEP "        "              // separación entre SP, VM y PWM en el monitor serie (vista legible)
-const uint8_t  LCD_ADDR_1 = 0x27;   // dirección típica del LCD I2C (PCF8574)
-const uint8_t  LCD_ADDR_2 = 0x3F;   // la otra típica (PCF8574A); se usa la que responda
-bool modoGrafico = false;           // 'V' por serie: false = legible, true = números crudos cada 10 ms
+// LCD I2C: la dirección se busca sola al arrancar (módulos PCF8574: 0x20..0x27, PCF8574A: 0x38..0x3F)
+bool modoGrafico = false;          // 'V' por serie: false = legible, true = números crudos cada 10 ms
 
 // =====================================================================
 //  Base de tiempo: Timer2 interrumpe cada 1 ms; getTime() devuelve us
@@ -143,6 +142,14 @@ void fijarCaudal(float q) {        // único lugar donde se cambia el setpoint
 
 void fijarPwmAbierto(float pct) { pctAbierto = constrain(pct, 0, 100); }
 
+// Aviso en el monitor cada vez que el encoder o el pulsador cambian algo (sirve para
+// comprobar que el encoder anda aunque el AS5600 no esté y el motor no gire).
+void avisarCambio() {
+  if (modoGrafico) return;                     // no ensuciar los datos para Excel
+  if (lazoAbierto) { Serial.print(F("# Encoder: PWM lazo abierto = ")); Serial.print(pctAbierto, 0); Serial.println(F(" %")); }
+  else             { Serial.print(F("# Encoder: SP = ")); Serial.print(setpointCaudal, 0); Serial.println(F(" cm3/min")); }
+}
+
 uint8_t leerEncoder() {
   return (digitalRead(PIN_ENC_A) ? 1 : 0) | (digitalRead(PIN_ENC_B) ? 2 : 0);
 }
@@ -171,6 +178,7 @@ void atenderEncoder() {
   if (clics) {
     if (lazoAbierto) fijarPwmAbierto(pctAbierto + clics * STEP_PWM_LA);
     else             fijarCaudal(setpointCaudal + clics * STEP_CAUDAL);
+    avisarCambio();
   }
 }
 
@@ -185,6 +193,7 @@ void atenderBoton() {               // pulsador: setpoint = 0 (antirrebote 30 ms
     if (sw == LOW) {
       if (lazoAbierto) fijarPwmAbierto(0);
       else             fijarCaudal(0);
+      avisarCambio();
     }
   }
 }
@@ -353,21 +362,45 @@ char   lcdQuiero[2][17] = {"SP    VM    PWM%", "                "};   // lo que 
 char   lcdHay[2][17]    = {"                ", "                "};   // lo que ya está escrito
 int8_t lcdFila = -1, lcdCol = -1;          // dónde quedó el cursor del LCD (-1 = no se sabe)
 
+void lcdTexto(uint8_t fila, const char *s);   // (definida más abajo)
+
 bool responde(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
 }
 
+// Recorre todo el bus I2C, muestra lo que encuentra y devuelve la dirección del LCD (0 = no hay).
+uint8_t escanearI2C() {
+  uint8_t lcdAddr = 0, n = 0;
+  Serial.print(F("# Bus I2C:"));
+  for (uint8_t a = 1; a < 127; a++) {
+    if (!responde(a)) continue;
+    n++;
+    Serial.print(F(" 0x")); Serial.print(a, HEX);
+    if (a == AS5600_ADDR) Serial.print(F("=AS5600"));
+    else if ((a >= 0x20 && a <= 0x27) || (a >= 0x38 && a <= 0x3F)) {
+      Serial.print(F("=LCD"));
+      if (!lcdAddr) lcdAddr = a;
+    }
+  }
+  if (n == 0) Serial.print(F(" NINGUNO -> revisar SDA=A4, SCL=A5, GND y 5V de los modulos"));
+  Serial.println();
+  return lcdAddr;
+}
+
 void iniciarLCD() {
-  uint8_t addr = responde(LCD_ADDR_1) ? LCD_ADDR_1 : (responde(LCD_ADDR_2) ? LCD_ADDR_2 : 0);
+  uint8_t addr = escanearI2C();
   if (!addr) {
-    Serial.println(F("# LCD no responde en 0x27 ni 0x3F (revisar cables). El control anda igual."));
+    Serial.println(F("# No hay LCD en el bus: si muestra cuadritos es porque nunca se inicializo."));
+    Serial.println(F("#   Revisar SDA/SCL del LCD (SDA=A4, SCL=A5) y GND. El control anda igual sin LCD."));
     return;
   }
   lcd = new LiquidCrystal_I2C(addr, 16, 2);
   lcd->init();                             // deja la pantalla en blanco; el texto lo escribe atenderLCD()
   lcd->backlight();
-  Serial.print(F("# LCD OK en 0x")); Serial.println(addr, HEX);
+  lcdTexto(1, "Iniciando...");
+  Serial.print(F("# LCD inicializado en 0x")); Serial.print(addr, HEX);
+  Serial.println(F(". Si igual ves cuadritos o nada, gira el preset azul del modulo (contraste)."));
 }
 
 void lcdTexto(uint8_t fila, const char *s) {   // define el texto de una fila (16 caracteres)
@@ -629,6 +662,10 @@ void setup() {
   encPrev = leerEncoder();
   habilitarPCINT(PIN_ENC_A);
   habilitarPCINT(PIN_ENC_B);
+  Serial.print(F("# Encoder en reposo: A(D4)=")); Serial.print(digitalRead(PIN_ENC_A));
+  Serial.print(F("  B(D5)="));                    Serial.print(digitalRead(PIN_ENC_B));
+  Serial.print(F("  pulsador(D3)="));             Serial.print(digitalRead(PIN_ENC_SW));
+  Serial.println(F("   (pulsador suelto = 1; al girar tiene que aparecer '# Encoder: SP = ...')"));
 
   imprimirGanancias();
   Serial.print(F("# Caudal: "));    Serial.print(CM3_POR_VUELTA, 2);

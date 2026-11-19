@@ -11,6 +11,7 @@
     grande, el programa aprende en qué parte de la vuelta el PID tiene que empujar de más
     (o de menos) y lo aplica un poco antes de llegar ahí en la vuelta siguiente.
     No cambia las ecuaciones del PID: es un término que se suma aparte (comando F).
+    Arranca APAGADA: primero conviene tener el PID estable y después probarla con F.
   - En LAZO ABIERTO (comando A) el PWM lo fijás vos y el PID no actúa.
   - Sin AS5600 (o sin imán) el motor NO arranca: sin medición no hay control.
   - El SETPOINT se configura en CAUDAL (cm3/min) y se convierte a RPM para el PID
@@ -25,10 +26,12 @@
     F        -> prende/apaga la compensación de la trabada;   R -> borra lo que aprendió
     V        -> vista legible (cada 0,5 s) <-> gráfico (cada 10 ms: t SP VM RPM PWM separados por TAB)
   Vista legible:
-    SP:   150 cm3/min        VM:   148 cm3/min ( 15.0 RPM)        PWM:  52 %        oscila: 14.1 a 16.0 RPM
+    SP:   150 cm3/min        VM:   148 cm3/min ( 15.0 RPM)        PWM:  52 % ( 48 a  56)        oscila: 14.1 a 16.0 RPM
       SP  = caudal que pediste (encoder o serie)
       VM  = valor medido por el AS5600, como caudal: media móvil simple de los últimos 2 s
-      PWM = lo que el PID le manda al motor, de 0 a 100 % (100 % = 12 V)
+      PWM = lo que el PID le manda al motor, de 0 a 100 % (100 % = 12 V): promedio de los
+            últimos 0,5 s y, entre paréntesis, el mínimo y el máximo. Si ves (0 a 100) el
+            PWM está saltando de punta a punta: las ganancias son demasiado altas.
       oscila = velocidad mínima y máxima de los últimos 0,5 s (sin promediar)
   LCD 1602 I2C (mismo bus: SDA = A4, SCL = A5):
       SP    VM    PWM%
@@ -52,12 +55,15 @@ const uint8_t REG_RAW_ANG = 0x0C;
 const uint8_t REG_AGC     = 0x1A;
 
 // ============ Constantes del PID ============
-// Ajustadas con un modelo de la bomba armado con tus mediciones (arranca con PWM ~135,
-// ~250 RPM al 100 %, dos frenadas por vuelta). Antes: Kp=0.40 Ki=0.30 Kd=0.002.
-// Se pueden retocar sin regrabar desde el monitor: P3 / I3 / D0.02
-float Kp = 3.0;      // [PWM / RPM]
-float Ki = 3.0;      // [PWM / (RPM*s)]
-float Kd = 0.02;     // [PWM * s / RPM]
+// Con Kp=3 / Ki=3 / Kd=0.02 la bomba oscilaba entre 75 y 300 RPM: con los golpes del
+// engranaje (juego entre dientes) P y D llevaban el PWM de 0 a 100 % todo el tiempo.
+// Con Kp=0.4 / Ki=0.3 / Kd=0.002 oscilaba entre 97 y 112 RPM a 100 RPM, pero la integral
+// era lenta. Estas quedan cerca de esas, con la integral un poco más rápida y sin D
+// (la derivada reacciona a cada golpe del engranaje y lo empeora).
+// Se pueden retocar sin regrabar desde el monitor: P0.5 / I0.5 / D0
+float Kp = 0.5;      // [PWM / RPM]
+float Ki = 0.5;      // [PWM / (RPM*s)]
+float Kd = 0.0;      // [PWM * s / RPM]
 
 // ============ Tiempos (us, medidos con getTime) ============
 const uint32_t T_LECTURA  = 2000;  // leer el AS5600 cada 2 ms (mide bien hasta 15000 RPM)
@@ -92,8 +98,8 @@ const float MAX_CAUDAL  = MAX_RPM * CM3_POR_VUELTA;
 const uint8_t NB_COMP       = 64;     // posiciones por vuelta (5,6° cada una)
 const float   COMP_GANANCIA = 0.3;    // cuánto aprende por pasada (más = más rápido, menos estable)
 const float   COMP_ADELANTO = 0.015;  // s: el motor tarda en responder, por eso se adelanta
-const float   COMP_MAX      = 100;    // límite de la corrección: ±100 de PWM (±39 %)
-bool compActiva = true;               // 'F' la prende/apaga, 'R' borra lo aprendido
+const float   COMP_MAX      = 50;     // límite de la corrección: ±50 de PWM (±20 %)
+bool compActiva = false;              // 'F' la prende/apaga, 'R' borra lo aprendido
 
 // ============ Pantalla ============
 const uint32_t T_PANTALLA = 500000; // cada cuánto se muestra una línea en la vista legible (us) = 0,5 s
@@ -389,7 +395,7 @@ void atenderLCD() {
 // =====================================================================
 //  Pantalla (monitor serie + LCD)
 // =====================================================================
-float    sumPwm = 0, minRpm = 0, maxRpm = 0;
+float    sumPwm = 0, minRpm = 0, maxRpm = 0, minPwm = 0, maxPwm = 0;
 uint16_t nPant = 0;
 uint32_t tPantalla = 0;
 
@@ -415,12 +421,15 @@ void mostrar(float rpm, float pwm) {
   }
   if (nPant == 0) {                           // arranca un período nuevo de 0,5 s
     minRpm = maxRpm = rpm;
+    minPwm = maxPwm = pwmPorc;
     sumPwm = 0;
   }
   sumPwm += pwmPorc;
   nPant++;
   if (rpm < minRpm) minRpm = rpm;
   if (rpm > maxRpm) maxRpm = rpm;
+  if (pwmPorc < minPwm) minPwm = pwmPorc;
+  if (pwmPorc > maxPwm) maxPwm = pwmPorc;
 
   uint32_t ahora = getTime();
   if (ahora - tPantalla < T_PANTALLA) return;
@@ -434,7 +443,8 @@ void mostrar(float rpm, float pwm) {
   else { Serial.print(F("SP:")); imprimirNum(setpointCaudal, 6, 0); Serial.print(F(" cm3/min" SEP)); }
   Serial.print(F("VM:"));   imprimirNum(vm, 6, 0);             Serial.print(F(" cm3/min ("));
   imprimirNum(rpmMedia, 5, 1);                                 Serial.print(F(" RPM)" SEP));
-  Serial.print(F("PWM:"));  imprimirNum(pwmProm, 4, 0);        Serial.print(F(" %" SEP));
+  Serial.print(F("PWM:"));  imprimirNum(pwmProm, 4, 0);        Serial.print(F(" % ("));
+  imprimirNum(minPwm, 3, 0); Serial.print(F(" a")); imprimirNum(maxPwm, 4, 0); Serial.print(F(")" SEP));
   Serial.print(F("oscila:")); imprimirNum(minRpm, 6, 1);
   Serial.print(F(" a"));      imprimirNum(maxRpm, 6, 1);       Serial.println(F(" RPM"));
 
@@ -479,15 +489,15 @@ void controlar() {
     float e = setpointRPM - rpmFilt;                  // error
     float P = Kp * e;
     float D = -Kd * (rpmFilt - rpmFiltPrev) / dt;     // derivada de la medición (sin salto al cambiar el setpoint)
-    float Inuevo = termI + Ki * e * dt;
-    float v = P + Inuevo + D + ff;
-    // Anti-windup: no integrar si la salida está saturada y el error empuja hacia ese lado
-    bool satArriba = (v > PWM_MAX) && (e > 0);
-    bool satAbajo  = (v < 0) && (e < 0);
-    if (!satArriba && !satAbajo) termI = Inuevo;
-    termI = constrain(termI, 0, PWM_MAX);
-    u = constrain(P + termI + D + ff, 0, PWM_MAX);
-    aprenderComp(P + termI + D, rpmFilt);             // aprende de lo que hizo el PID en esta posición
+    // Anti-windup: la integral SIEMPRE integra (así corrige la media aunque P sature en un
+    // pico) pero queda limitada a 0..255: sola nunca puede pedir más que 0..100 % de PWM.
+    // (Antes dejaba de integrar cuando la salida saturaba; con los golpes del engranaje
+    //  saturaba casi siempre, la integral quedaba congelada y la media no llegaba al SP.)
+    termI = constrain(termI + Ki * e * dt, 0, PWM_MAX);
+    float v = P + termI + D + ff;
+    u = constrain(v, 0, PWM_MAX);
+    if (v >= 0 && v <= PWM_MAX)                       // no aprender mientras la salida satura
+      aprenderComp(P + termI + D, rpmFilt);           // aprende de lo que hizo el PID en esta posición
   }
   rpmFiltPrev = rpmFilt;
   analogWrite(PIN_MOTOR, (int)(u + 0.5));

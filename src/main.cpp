@@ -26,13 +26,16 @@
     F        -> prende/apaga la compensación de la trabada;   R -> borra lo que aprendió
     V        -> vista legible (cada 0,5 s) <-> gráfico (cada 10 ms: t SP VM RPM PWM separados por TAB)
   Vista legible:
-    SP:   150 cm3/min        VM:   148 cm3/min ( 15.0 RPM)        PWM:  52 % ( 48 a  56)        oscila: 14.1 a 16.0 RPM
+    SP:  1400 cm3/min        VM:  1395 cm3/min (141.3 RPM)        PWM:  66 % ( 60 a  72)        oscila:  1350 a  1440 cm3/min        [lect. malas:0  AGC:120-131]
       SP  = caudal que pediste (encoder o serie)
       VM  = valor medido por el AS5600, como caudal: media móvil simple de los últimos 2 s
       PWM = lo que el PID le manda al motor, de 0 a 100 % (100 % = 12 V): promedio de los
             últimos 0,5 s y, entre paréntesis, el mínimo y el máximo. Si ves (0 a 100) el
             PWM está saltando de punta a punta: las ganancias son demasiado altas.
-      oscila = velocidad mínima y máxima de los últimos 0,5 s (sin promediar)
+      oscila = caudal mínimo y máximo de los últimos 0,5 s (sin promediar)
+      [lect. malas] = lecturas del AS5600 descartadas por imposibles en esos 0,5 s.
+      [AGC] = ganancia del AS5600 (mín-máx): si varía mucho, el imán se aleja/acerca en la
+              vuelta (disco que se bambolea). IMAN! = el AS5600 avisó imán débil/fuerte/ausente.
   LCD 1602 I2C (mismo bus: SDA = A4, SCL = A5):
       SP    VM    PWM%
       150   148   52
@@ -55,19 +58,23 @@ const uint8_t REG_RAW_ANG = 0x0C;
 const uint8_t REG_AGC     = 0x1A;
 
 // ============ Constantes del PID ============
-// Con Kp=3 / Ki=3 / Kd=0.02 la bomba oscilaba entre 75 y 300 RPM: con los golpes del
-// engranaje (juego entre dientes) P y D llevaban el PWM de 0 a 100 % todo el tiempo.
-// Con Kp=0.4 / Ki=0.3 / Kd=0.002 oscilaba entre 97 y 112 RPM a 100 RPM, pero la integral
-// era lenta. Estas quedan cerca de esas, con la integral un poco más rápida y sin D
-// (la derivada reacciona a cada golpe del engranaje y lo empeora).
-// Se pueden retocar sin regrabar desde el monitor: P0.5 / I0.5 / D0
-float Kp = 0.5;      // [PWM / RPM]
-float Ki = 0.5;      // [PWM / (RPM*s)]
-float Kd = 0.0;      // [PWM * s / RPM]
+// Las oscilaciones enormes (picos de 300 a 1200 RPM, imposibles para este disco) eran
+// LECTURAS MALAS del AS5600 una vez por vuelta: el PID las tomaba como velocidad real y
+// cortaba el PWM. Con esas lecturas descartadas (ver VEL_MAX_FISICA) se puede usar un PID
+// más firme: si frenás el disco con la mano, empuja enseguida, y al soltarlo vuelve rápido.
+// Más agresivo: P2 I4 (o P3 I6). Si sin frenar el PWM ya va de 0 a 100 %, es demasiado.
+// Se pueden retocar sin regrabar desde el monitor: P1.5 / I3 / D0
+float Kp = 1.5;      // [PWM / RPM]
+float Ki = 3.0;      // [PWM / (RPM*s)]
+float Kd = 0.0;      // [PWM * s / RPM]   (la D reacciona a cada golpe del engranaje: mejor sin)
 
 // ============ Tiempos (us, medidos con getTime) ============
-const uint32_t T_LECTURA  = 2000;  // leer el AS5600 cada 2 ms (mide bien hasta 15000 RPM)
-const uint8_t  N_LECTURAS = 5;     // correr el PID cada 5 lecturas -> Ts = 10 ms
+const uint32_t T_LECTURA  = 5000;  // leer el AS5600 cada 5 ms (mide bien hasta 6000 RPM: sobra)
+const uint8_t  N_LECTURAS = 2;     // correr el PID cada 2 lecturas -> Ts = 10 ms
+// Filtro de lecturas imposibles: el engranaje grande no llega ni a 300 RPM al 100 % de PWM.
+// Si entre dos lecturas el ángulo "salta" más de lo que permitiría esta velocidad, la
+// lectura es mala (imán que se aleja del chip, ruido en el I2C) y se descarta.
+const float    VEL_MAX_FISICA = 400;   // [RPM]
 
 // ============ Otros ============
 const int8_t  ENC_DIV  = 4;        // transiciones por clic (si salta de a 2 clics, poné 2)
@@ -253,8 +260,10 @@ int32_t  posCtrlPrev = 0;        // posición y tiempo en el PID anterior
 uint32_t tCtrlPrev = 0;
 uint8_t  fallosI2C = 1;          // > 0 obliga a re-referenciar en la próxima lectura
 int8_t   sentidoGiro = 1;        // +1 / -1 según hacia dónde crece el ángulo
+uint16_t lecturasMalas = 0;      // lecturas descartadas por imposibles (se muestra cada 0,5 s)
+uint8_t  malasSeguidas = 0;
 
-void muestrearAngulo() {         // se llama cada 2 ms
+void muestrearAngulo() {         // se llama cada T_LECTURA
   uint32_t t = getTime();
   uint16_t a;
   if (!leerAngulo(a)) {
@@ -262,19 +271,43 @@ void muestrearAngulo() {         // se llama cada 2 ms
     return;
   }
   if (fallosI2C) {               // primera lectura o venimos de un fallo: re-referenciar
-    fallosI2C   = 0;
-    angPrev     = a;
-    tPos        = t;
-    posCtrlPrev = posCuentas;
-    tCtrlPrev   = t;
+    fallosI2C     = 0;
+    malasSeguidas = 0;
+    angPrev       = a;
+    tPos          = t;
+    posCtrlPrev   = posCuentas;
+    tCtrlPrev     = t;
     return;
   }
   int16_t d = (int16_t)a - (int16_t)angPrev;
   if (d > 2047)       d -= 4096;   // cruce 4095 -> 0
   else if (d < -2048) d += 4096;
+  // Lectura imposible: más giro del que permite VEL_MAX_FISICA en el tiempo transcurrido.
+  // Se descarta sin mover la referencia; la próxima lectura buena se compara con la última buena.
+  float dMax = VEL_MAX_FISICA / 60.0 * 4096.0 * (float)(t - tPos) * 1e-6 + 4;   // +4 cuentas de ruido
+  if (abs(d) > dMax) {
+    lecturasMalas++;
+    if (++malasSeguidas >= 3) fallosI2C = 1;   // 3 seguidas: algo cambió de verdad -> re-referenciar
+    return;
+  }
+  malasSeguidas = 0;
   angPrev = a;
   posCuentas += d;
   tPos = t;
+}
+
+// Diagnóstico del imán: el AGC del AS5600 sube cuando el imán se aleja y baja cuando se acerca.
+// Si varía mucho durante la vuelta, el disco se bambolea (y ahí aparecen las lecturas malas).
+uint8_t agcMin = 255, agcMax = 0;
+bool    imanFlojo = false;       // en los últimos 0,5 s el AS5600 avisó imán débil, fuerte o ausente
+
+void leerDiagnosticoIman() {
+  uint8_t st, agc;
+  if (leerRegistros(REG_AGC, &agc, 1)) {
+    if (agc < agcMin) agcMin = agc;
+    if (agc > agcMax) agcMax = agc;
+  }
+  if (leerRegistros(REG_STATUS, &st, 1) && (!(st & 0x20) || (st & 0x18))) imanFlojo = true;
 }
 
 // Velocidad media desde el PID anterior, con el tiempo REAL entre lecturas.
@@ -478,8 +511,14 @@ void mostrar(float rpm, float pwm) {
   imprimirNum(rpmMedia, 5, 1);                                 Serial.print(F(" RPM)" SEP));
   Serial.print(F("PWM:"));  imprimirNum(pwmProm, 4, 0);        Serial.print(F(" % ("));
   imprimirNum(minPwm, 3, 0); Serial.print(F(" a")); imprimirNum(maxPwm, 4, 0); Serial.print(F(")" SEP));
-  Serial.print(F("oscila:")); imprimirNum(minRpm, 6, 1);
-  Serial.print(F(" a"));      imprimirNum(maxRpm, 6, 1);       Serial.println(F(" RPM"));
+  Serial.print(F("oscila:")); imprimirNum(minRpm * CM3_POR_VUELTA, 6, 0);
+  Serial.print(F(" a"));      imprimirNum(maxRpm * CM3_POR_VUELTA, 6, 0); Serial.print(F(" cm3/min" SEP));
+  // Diagnóstico de la medición: lecturas descartadas y AGC del imán en estos 0,5 s
+  Serial.print(F("[lect. malas:")); Serial.print(lecturasMalas);
+  Serial.print(F("  AGC:")); Serial.print(agcMin); Serial.print('-'); Serial.print(agcMax);
+  if (imanFlojo) Serial.print(F("  IMAN!"));
+  Serial.println(']');
+  lecturasMalas = 0; agcMin = 255; agcMax = 0; imanFlojo = false;
 
   char fila[17];                              // "SP    VM    PWM%"  ->  "150   148   52  "
   if (lazoAbierto) {
@@ -522,12 +561,15 @@ void controlar() {
     float e = setpointRPM - rpmFilt;                  // error
     float P = Kp * e;
     float D = -Kd * (rpmFilt - rpmFiltPrev) / dt;     // derivada de la medición (sin salto al cambiar el setpoint)
-    // Anti-windup: la integral SIEMPRE integra (así corrige la media aunque P sature en un
-    // pico) pero queda limitada a 0..255: sola nunca puede pedir más que 0..100 % de PWM.
-    // (Antes dejaba de integrar cuando la salida saturaba; con los golpes del engranaje
-    //  saturaba casi siempre, la integral quedaba congelada y la media no llegaba al SP.)
-    termI = constrain(termI + Ki * e * dt, 0, PWM_MAX);
-    float v = P + termI + D + ff;
+    // Anti-windup (integración condicional): si la salida ya está en 0 % o 100 % y el error
+    // empuja hacia ese mismo lado, la integral no sigue creciendo. Así, si frenás el motor con
+    // la mano, la integral no se "carga" y al soltarlo vuelve rápido sin pasarse de largo.
+    float Inuevo = termI + Ki * e * dt;
+    float v = P + Inuevo + D + ff;
+    bool satArriba = (v > PWM_MAX) && (e > 0);
+    bool satAbajo  = (v < 0) && (e < 0);
+    if (!satArriba && !satAbajo) termI = constrain(Inuevo, 0, PWM_MAX);
+    v = P + termI + D + ff;
     u = constrain(v, 0, PWM_MAX);
     if (v >= 0 && v <= PWM_MAX)                       // no aprender mientras la salida satura
       aprenderComp(P + termI + D, rpmFilt);           // aprende de lo que hizo el PID en esta posición
@@ -714,6 +756,9 @@ void loop() {
     Serial.println(F("# Se perdio la lectura del AS5600: motor apagado"));
     return;
   }
+
+  static uint8_t nDiag = 0;
+  if (++nDiag >= 20) { nDiag = 0; leerDiagnosticoIman(); }     // AGC y estado del imán cada 100 ms
 
   if (++nLect < N_LECTURAS) return;                           // PID cada 10 ms
   nLect = 0;

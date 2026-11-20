@@ -27,6 +27,8 @@
     F        -> prende/apaga la compensación de la trabada;   R -> borra lo que aprendió
     V        -> vista legible (cada 0,5 s) <-> gráfico (cada 10 ms: t SP VM RPM PWM separados por TAB)
     L        -> LCD: prueba el siguiente cableado del módulo I2C (y lo guarda en la EEPROM)
+    G        -> ENSAYO de 24 s: graba posición, velocidad y PWM cada 10 ms (sin comp, lazo
+                abierto y con comp) para analizar la bomba real
   Vista legible:
     SP:  1400 cm3/min        VM:  1395 cm3/min (141.3 RPM)        PWM:  66 % ( 60 a  72)        oscila:  1350 a  1440 cm3/min        [lect. malas:0  AGC:120-131]
       SP  = caudal que pediste (encoder o serie)
@@ -109,6 +111,19 @@ const float   COMP_GANANCIA = 0.3;    // cuánto aprende por pasada (más = más
 const float   COMP_ADELANTO = 0.015;  // s: el motor tarda en responder, por eso se adelanta
 const float   COMP_MAX      = 80;     // límite de la corrección: ±80 de PWM (±31 %)
 bool compActiva = true;               // 'F' la prende/apaga, 'R' borra lo aprendido
+
+// ============ Ensayo con captura de datos (comando G) ============
+// Graba 3 tramos de 8 s, una línea cada 10 ms (para analizar la bomba real en la PC):
+//   1) lazo cerrado SIN compensación   2) lazo ABIERTO con el PWM medio del tramo 1
+//   3) lazo cerrado CON compensación
+// Cada línea: t[ms]  ang[0..4095]  rpm[sin filtro]  pwm[0..255]  comp[PWM]  (separados por TAB)
+const uint32_t CAP_TRAMO = 8000000UL;   // 8 s por tramo
+uint8_t  capFase = 0;                   // 0 = no está grabando; 1, 2, 3 = tramo
+uint32_t capT0 = 0;
+float    capSumPwm = 0;
+uint16_t capN = 0;
+bool     capCompAntes = true;
+float    rpmCrudo = 0, ffActual = 0;    // última velocidad sin filtrar y última compensación
 
 // ============ Pantalla ============
 const uint32_t T_PANTALLA = 500000; // cada cuánto se muestra una línea en la vista legible (us) = 0,5 s
@@ -551,6 +566,15 @@ void mostrar(float rpm, float pwm) {
   float rpmMedia = mediaMovil(rpm);
   float pwmPorc  = pwm * 100.0 / PWM_MAX;
 
+  if (capFase) {                              // ensayo G: datos crudos para analizar
+    Serial.print(getTime() / 1000);  Serial.print('\t');
+    Serial.print(angPrev);           Serial.print('\t');
+    Serial.print(rpmCrudo, 1);       Serial.print('\t');
+    Serial.print(pwm, 0);            Serial.print('\t');
+    Serial.println(ffActual, 0);
+    return;
+  }
+
   if (modoGrafico) {   // t[s]  SP[cm3/min]  VM[cm3/min, sin promediar]  RPM  PWM[%]  separados por TAB (Excel)
     Serial.print(getTime() * 1e-6, 3);         Serial.print('\t');
     Serial.print(setpointCaudal, 1);           Serial.print('\t');
@@ -629,6 +653,8 @@ void controlar() {
   if (!calcularRPM(rpm, dt)) return;              // sin datos nuevos: mantener la salida
 
   rpmFilt += ALPHA * (rpm - rpmFilt);
+  rpmCrudo = rpm;
+  ffActual = 0;
 
   if (lazoAbierto) {                                  // LAZO ABIERTO: PWM fijo, el PID no actúa
     u = pctAbierto * PWM_MAX / 100.0;
@@ -637,6 +663,7 @@ void controlar() {
     termI = 0;
   } else {
     float ff = compensacion(rpmFilt);                 // compensación de la trabada (0 si está apagada)
+    ffActual = ff;
     float e = setpointRPM - rpmFilt;                  // error
     float P = Kp * e;
     float D = -Kd * (rpmFilt - rpmFiltPrev) / dt;     // derivada de la medición (sin salto al cambiar el setpoint)
@@ -657,6 +684,45 @@ void controlar() {
   analogWrite(PIN_MOTOR, (int)(u + 0.5));
 
   mostrar(rpmFilt, u);
+}
+
+// =====================================================================
+//  Ensayo G: tres tramos de 8 s con captura de datos
+// =====================================================================
+void empezarCaptura() {
+  if (lazoAbierto || setpointRPM <= 0) {
+    Serial.println(F("# Para el ensayo G: lazo cerrado (C) y un setpoint > 0 (el de trabajo, ej. 1400)"));
+    return;
+  }
+  capCompAntes = compActiva;
+  compActiva = false;
+  capFase = 1; capT0 = getTime(); capSumPwm = 0; capN = 0;
+  Serial.println(F("# ENSAYO G (24 s). Columnas: t[ms] ang rpm pwm comp"));
+  Serial.println(F("# tramo 1/3: lazo cerrado SIN compensacion"));
+}
+
+void atenderCaptura() {
+  if (!capFase) return;
+  if (capFase == 1) { capSumPwm += u; capN++; }
+  uint32_t ahora = getTime();
+  if (ahora - capT0 < CAP_TRAMO) return;
+  capT0 = ahora;
+  if (capFase == 1) {                           // tramo 2: lazo abierto con el PWM medio del tramo 1
+    pctAbierto = capN ? capSumPwm / capN * 100.0 / PWM_MAX : 0;
+    lazoAbierto = true;
+    capFase = 2;
+    Serial.print(F("# tramo 2/3: LAZO ABIERTO con PWM fijo ")); Serial.print(pctAbierto, 1); Serial.println(F(" %"));
+  } else if (capFase == 2) {                    // tramo 3: lazo cerrado con compensación
+    lazoAbierto = false;
+    termI = constrain(u - Kp * (setpointRPM - rpmFilt), 0, PWM_MAX);   // sin salto
+    compActiva = true;
+    capFase = 3;
+    Serial.println(F("# tramo 3/3: lazo cerrado CON compensacion"));
+  } else {                                      // fin: vuelve como estaba
+    compActiva = capCompAntes;
+    capFase = 0;
+    Serial.println(F("# FIN DEL ENSAYO G: mandame el archivo .log que quedo en la carpeta del proyecto"));
+  }
 }
 
 // =====================================================================
@@ -694,6 +760,7 @@ void imprimirAyuda() {
   Serial.println(F("#  F          prende/apaga la compensacion de la trabada;  R = borrar lo aprendido"));
   Serial.println(F("#  V          vista legible <-> grafico (t SP VM RPM PWM, cada 10 ms, separados por TAB)"));
   Serial.println(F("#  L          LCD: probar el siguiente cableado del modulo I2C (queda guardado)"));
+  Serial.println(F("#  G          ENSAYO de 24 s con captura de datos (con el setpoint de trabajo)"));
   Serial.println(F("#  ?          esta ayuda"));
   Serial.println(F("# -----------------------------------------------------------------"));
 }
@@ -719,6 +786,8 @@ void procesarComando(char *s) {
   } else if (c == 'F') {
     compActiva = !compActiva;
     imprimirModo();
+  } else if (c == 'G') {
+    empezarCaptura();
   } else if (c == 'L') {
     probarSiguienteMapaLCD();
   } else if (c == 'R') {
@@ -845,5 +914,6 @@ void loop() {
   if (++nLect < N_LECTURAS) return;                           // PID cada 10 ms
   nLect = 0;
   controlar();
-  atenderLCD();                                               // hasta 2 caracteres del LCD por ciclo
+  atenderCaptura();                                           // ensayo G (si está corriendo)
+  atenderLCD();                                               // hasta 3 caracteres del LCD por ciclo
 }

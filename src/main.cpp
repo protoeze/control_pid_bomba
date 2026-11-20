@@ -11,7 +11,8 @@
     grande, el programa aprende en qué parte de la vuelta el PID tiene que empujar de más
     (o de menos) y lo aplica un poco antes de llegar ahí en la vuelta siguiente.
     No cambia las ecuaciones del PID: es un término que se suma aparte (comando F).
-    Arranca APAGADA: primero conviene tener el PID estable y después probarla con F.
+    Un PID solo no puede anticipar (reacciona cuando ya hay error); esto sí: aprende en
+    20-30 s y después empuja ANTES de llegar a la trabada. Arranca PRENDIDA.
   - En LAZO ABIERTO (comando A) el PWM lo fijás vos y el PID no actúa.
   - Sin AS5600 (o sin imán) el motor NO arranca: sin medición no hay control.
   - El SETPOINT se configura en CAUDAL (cm3/min) y se convierte a RPM para el PID
@@ -25,6 +26,7 @@
     C        -> volver a LAZO CERRADO, sin salto en el PWM
     F        -> prende/apaga la compensación de la trabada;   R -> borra lo que aprendió
     V        -> vista legible (cada 0,5 s) <-> gráfico (cada 10 ms: t SP VM RPM PWM separados por TAB)
+    L        -> LCD: prueba el siguiente cableado del módulo I2C (y lo guarda en la EEPROM)
   Vista legible:
     SP:  1400 cm3/min        VM:  1395 cm3/min (141.3 RPM)        PWM:  66 % ( 60 a  72)        oscila:  1350 a  1440 cm3/min        [lect. malas:0  AGC:120-131]
       SP  = caudal que pediste (encoder o serie)
@@ -43,7 +45,7 @@
 */
 #include <Arduino.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
 
 // ============ Pines ============
 const uint8_t PIN_MOTOR  = 9;    // PWM (Timer1) -> R2 -> gate del IRLZ44N
@@ -105,8 +107,8 @@ const float MAX_CAUDAL  = MAX_RPM * CM3_POR_VUELTA;
 const uint8_t NB_COMP       = 64;     // posiciones por vuelta (5,6° cada una)
 const float   COMP_GANANCIA = 0.3;    // cuánto aprende por pasada (más = más rápido, menos estable)
 const float   COMP_ADELANTO = 0.015;  // s: el motor tarda en responder, por eso se adelanta
-const float   COMP_MAX      = 50;     // límite de la corrección: ±50 de PWM (±20 %)
-bool compActiva = false;              // 'F' la prende/apaga, 'R' borra lo aprendido
+const float   COMP_MAX      = 80;     // límite de la corrección: ±80 de PWM (±31 %)
+bool compActiva = true;               // 'F' la prende/apaga, 'R' borra lo aprendido
 
 // ============ Pantalla ============
 const uint32_t T_PANTALLA = 500000; // cada cuánto se muestra una línea en la vista legible (us) = 0,5 s
@@ -388,14 +390,70 @@ float mediaMovil(float rpm) {     // agrega una muestra y devuelve el promedio d
 }
 
 // =====================================================================
-//  LCD 1602 I2C  (arriba: "SP    VM    PWM%" o "LA ..." en lazo abierto; abajo los valores)
+//  LCD 1602 con módulo I2C (PCF8574)  -  driver propio
 // =====================================================================
-LiquidCrystal_I2C *lcd = nullptr;         // se crea en setup() con la dirección que responda
-char   lcdQuiero[2][17] = {"SP    VM    PWM%", "                "};   // lo que se quiere mostrar
-char   lcdHay[2][17]    = {"                ", "                "};   // lo que ya está escrito
-int8_t lcdFila = -1, lcdCol = -1;          // dónde quedó el cursor del LCD (-1 = no se sabe)
+// Los módulos I2C para LCD NO están todos cableados igual entre el chip PCF8574 y las patas
+// del LCD. Con el cableado equivocado el LCD no muestra nada (o se apaga la luz). Acá están
+// los cableados conocidos; el comando L prueba el siguiente y lo guarda en la EEPROM.
+struct MapaLCD { uint8_t rs, rw, en, bl, corrimiento; bool blNegado; const char *nombre; };
+const MapaLCD MAPAS[] = {
+  //  RS    RW    EN    luz   D4..D7  luz al revés
+  { 0x01, 0x02, 0x04, 0x08,   4,     false, "estandar" },   // el más común (dirección 0x27 / 0x3F)
+  { 0x40, 0x20, 0x10, 0x80,   0,     true,  "mjkdz"    },   // muy común en dirección 0x20
+  { 0x40, 0x20, 0x10, 0x80,   0,     false, "mjkdz-2"  },
+  { 0x01, 0x02, 0x04, 0x08,   4,     true,  "estandar-2" },
+};
+const uint8_t N_MAPAS = sizeof(MAPAS) / sizeof(MAPAS[0]);
+const int     EEPROM_MAPA = 0;                 // dónde se guarda el cableado elegido
 
-void lcdTexto(uint8_t fila, const char *s);   // (definida más abajo)
+uint8_t lcdAddr = 0;                           // 0 = no hay LCD
+uint8_t lcdMapa = 0;
+char    lcdQuiero[2][17] = {"SP    VM    PWM%", "                "};   // lo que se quiere mostrar
+char    lcdHay[2][17]    = {"                ", "                "};   // lo que ya está escrito
+int8_t  lcdFila = -1, lcdCol = -1;             // dónde quedó el cursor del LCD (-1 = no se sabe)
+
+void lcdTexto(uint8_t fila, const char *s) {   // define el texto de una fila (16 caracteres)
+  for (uint8_t i = 0; i < 16; i++) lcdQuiero[fila][i] = *s ? *s++ : ' ';
+}
+
+uint8_t lcdLuz() { return MAPAS[lcdMapa].blNegado ? 0 : MAPAS[lcdMapa].bl; }   // bits con la luz prendida
+
+// Un byte al LCD en modo 4 bits: dos mitades con un pulso de EN cada una (el LCD lee en el
+// flanco de bajada de EN). Va todo en una sola transacción I2C de 4 bytes: ~0,5 ms.
+bool lcdEnviar(uint8_t valor, bool esDato) {
+  const MapaLCD &m = MAPAS[lcdMapa];
+  uint8_t base = lcdLuz() | (esDato ? m.rs : 0);          // RW siempre en 0 (solo escribimos)
+  uint8_t alto = base | (((valor >> 4) & 0x0F) << m.corrimiento);
+  uint8_t bajo = base | ((valor & 0x0F) << m.corrimiento);
+  Wire.beginTransmission(lcdAddr);
+  Wire.write(alto | m.en); Wire.write(alto);
+  Wire.write(bajo | m.en); Wire.write(bajo);
+  return Wire.endTransmission() == 0;
+}
+
+void lcdMedioByte(uint8_t nibble) {            // solo para la secuencia de arranque
+  const MapaLCD &m = MAPAS[lcdMapa];
+  uint8_t b = lcdLuz() | ((nibble & 0x0F) << m.corrimiento);
+  Wire.beginTransmission(lcdAddr);
+  Wire.write(b | m.en); Wire.write(b);
+  Wire.endTransmission();
+}
+
+// Secuencia de arranque del HD44780 en 4 bits (hoja de datos, figura 24)
+void lcdArrancar() {
+  delay(50);                                   // el LCD necesita >40 ms después de alimentarse
+  Wire.beginTransmission(lcdAddr); Wire.write(lcdLuz()); Wire.endTransmission();
+  lcdMedioByte(0x3); delay(5);
+  lcdMedioByte(0x3); delayMicroseconds(150);
+  lcdMedioByte(0x3); delayMicroseconds(150);
+  lcdMedioByte(0x2); delayMicroseconds(150);   // a partir de acá, modo 4 bits
+  lcdEnviar(0x28, false);                      // 4 bits, 2 renglones, letra 5x8
+  lcdEnviar(0x0C, false);                      // pantalla prendida, sin cursor
+  lcdEnviar(0x01, false); delay(2);            // borrar (tarda 1,5 ms)
+  lcdEnviar(0x06, false);                      // escribir de izquierda a derecha
+  for (uint8_t f = 0; f < 2; f++) for (uint8_t i = 0; i < 16; i++) lcdHay[f][i] = ' ';
+  lcdFila = lcdCol = -1;
+}
 
 bool responde(uint8_t addr) {
   Wire.beginTransmission(addr);
@@ -421,35 +479,51 @@ uint8_t escanearI2C() {
   return lcdAddr;
 }
 
+void imprimirMapaLCD() {
+  Serial.print(F("# LCD en 0x")); Serial.print(lcdAddr, HEX);
+  Serial.print(F(" con cableado ")); Serial.print(lcdMapa + 1); Serial.print('/'); Serial.print(N_MAPAS);
+  Serial.print(F(" (")); Serial.print(MAPAS[lcdMapa].nombre);
+  Serial.println(F("). Si el LCD no muestra texto, manda L para probar el siguiente cableado."));
+  Serial.println(F("#   Si con ninguno se ve nada, gira el preset azul de atras del modulo (contraste)."));
+}
+
 void iniciarLCD() {
-  uint8_t addr = escanearI2C();
-  if (!addr) {
+  lcdAddr = escanearI2C();
+  if (!lcdAddr) {
     Serial.println(F("# No hay LCD en el bus: si muestra cuadritos es porque nunca se inicializo."));
     Serial.println(F("#   Revisar SDA/SCL del LCD (SDA=A4, SCL=A5) y GND. El control anda igual sin LCD."));
     return;
   }
-  lcd = new LiquidCrystal_I2C(addr, 16, 2);
-  lcd->init();                             // deja la pantalla en blanco; el texto lo escribe atenderLCD()
-  lcd->backlight();
+  uint8_t guardado = EEPROM.read(EEPROM_MAPA);
+  if (guardado < N_MAPAS) lcdMapa = guardado;               // el que elegiste con L
+  else                    lcdMapa = (lcdAddr == 0x20) ? 1 : 0;   // sin elegir: según la dirección
+  lcdArrancar();
   lcdTexto(1, "Iniciando...");
-  Serial.print(F("# LCD inicializado en 0x")); Serial.print(addr, HEX);
-  Serial.println(F(". Si igual ves cuadritos o nada, gira el preset azul del modulo (contraste)."));
+  imprimirMapaLCD();
 }
 
-void lcdTexto(uint8_t fila, const char *s) {   // define el texto de una fila (16 caracteres)
-  for (uint8_t i = 0; i < 16; i++) lcdQuiero[fila][i] = *s ? *s++ : ' ';
+// Comando L: prueba el siguiente cableado, escribe en el LCD cuál es y lo guarda.
+void probarSiguienteMapaLCD() {
+  if (!lcdAddr) { iniciarLCD(); if (!lcdAddr) return; }
+  lcdMapa = (lcdMapa + 1) % N_MAPAS;
+  EEPROM.update(EEPROM_MAPA, lcdMapa);
+  lcdArrancar();
+  char txt[17];
+  snprintf(txt, sizeof(txt), "Cableado %u/%u", lcdMapa + 1, N_MAPAS);
+  lcdTexto(1, txt);
+  imprimirMapaLCD();
 }
 
-// Escribe de a poco: como mucho 2 caracteres por llamada y solo los que cambiaron.
-// Cada carácter por I2C tarda ~1,5 ms; así el LCD no frena las lecturas del AS5600.
+// Escribe de a poco: como mucho 3 caracteres por llamada y solo los que cambiaron
+// (~0,5 ms cada uno), así el LCD no frena las lecturas del AS5600.
 void atenderLCD() {
-  if (!lcd) return;
+  if (!lcdAddr) return;
   uint8_t escritos = 0;
   for (uint8_t f = 0; f < 2; f++) {
-    for (uint8_t i = 0; i < 16 && escritos < 2; i++) {
+    for (uint8_t i = 0; i < 16 && escritos < 3; i++) {
       if (lcdQuiero[f][i] == lcdHay[f][i]) continue;
-      if (lcdFila != (int8_t)f || lcdCol != (int8_t)i) lcd->setCursor(i, f);
-      lcd->write((uint8_t)lcdQuiero[f][i]);
+      if (lcdFila != (int8_t)f || lcdCol != (int8_t)i) lcdEnviar(0x80 | (i + (f ? 0x40 : 0)), false);
+      lcdEnviar((uint8_t)lcdQuiero[f][i], true);
       lcdHay[f][i] = lcdQuiero[f][i];
       lcdFila = f;
       lcdCol = i + 1;
@@ -517,6 +591,11 @@ void mostrar(float rpm, float pwm) {
   Serial.print(F("[lect. malas:")); Serial.print(lecturasMalas);
   Serial.print(F("  AGC:")); Serial.print(agcMin); Serial.print('-'); Serial.print(agcMax);
   if (imanFlojo) Serial.print(F("  IMAN!"));
+  if (compActiva && !lazoAbierto) {           // cuánto está corrigiendo la compensación (±% de PWM)
+    int16_t cmin = 32767, cmax = -32768;
+    for (uint8_t k = 0; k < NB_COMP; k++) { if (tablaComp[k] < cmin) cmin = tablaComp[k]; if (tablaComp[k] > cmax) cmax = tablaComp[k]; }
+    Serial.print(F("  comp:+-")); Serial.print((cmax - cmin) / 32.0 * 100.0 / PWM_MAX, 0); Serial.print('%');
+  }
   Serial.println(']');
   lecturasMalas = 0; agcMin = 255; agcMax = 0; imanFlojo = false;
 
@@ -614,6 +693,7 @@ void imprimirAyuda() {
   Serial.println(F("#  C          volver a LAZO CERRADO (sin salto)"));
   Serial.println(F("#  F          prende/apaga la compensacion de la trabada;  R = borrar lo aprendido"));
   Serial.println(F("#  V          vista legible <-> grafico (t SP VM RPM PWM, cada 10 ms, separados por TAB)"));
+  Serial.println(F("#  L          LCD: probar el siguiente cableado del modulo I2C (queda guardado)"));
   Serial.println(F("#  ?          esta ayuda"));
   Serial.println(F("# -----------------------------------------------------------------"));
 }
@@ -639,6 +719,8 @@ void procesarComando(char *s) {
   } else if (c == 'F') {
     compActiva = !compActiva;
     imprimirModo();
+  } else if (c == 'L') {
+    probarSiguienteMapaLCD();
   } else if (c == 'R') {
     borrarComp();
     Serial.println(F("# Compensacion borrada: vuelve a aprender desde cero"));
@@ -694,7 +776,7 @@ void setup() {
   Wire.begin();
   Wire.setClock(100000);             // 100 kHz: lo más robusto con cables y con el LCD en el bus
   Wire.setWireTimeout(3000, true);   // si el bus se cuelga por ruido, la lectura falla en vez de trabar todo
-  iniciarLCD();                      // (la biblioteca vuelve a llamar a Wire.begin(): se reconfigura abajo)
+  iniciarLCD();                      // busca el LCD en el bus y lo arranca
   Wire.setClock(100000);
   Wire.setWireTimeout(3000, true);
 
